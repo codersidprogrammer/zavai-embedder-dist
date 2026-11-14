@@ -497,9 +497,52 @@ install_tarball() {
     run install -d -o root -g zavai -m 0750 "$ETC"
 }
 
+torch_site_packages() {
+    # Where the bundled interpreter keeps its packages. `pip` decides whether a
+    # requirement is already satisfied from the metadata in this directory, so
+    # this is also the place where a stale `*.dist-info` can lie to it.
+    "$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])'
+}
+
+pinned_version() {
+    # pinned_version <name>: the version the artifact's constraints pin, for
+    # when the installed tree is too damaged to report its own version.
+    awk -F'==' -v name="$1" '$1 == name { print $2; exit }' "$CONSTRAINTS" 2>/dev/null \
+        | sed 's/+.*//'
+}
+
+prune_torch() {
+    # Remove every torch/torchvision tree and every piece of their metadata,
+    # whatever local version label the metadata carries.
+    #
+    # dpkg restores the artifact's CPU tree on an upgrade but does not own the
+    # files a previous `--with-cuda` installed, so a host that already swapped
+    # once carries `torch-<v>+cu126.dist-info` beside the `torch-<v>+cpu.dist-info`
+    # dpkg just unpacked. `pip uninstall` deletes the files named by *one*
+    # RECORD — the CPU build's `torch/__init__.py` among them — and the cu126
+    # metadata then keeps answering the next `pip install torch==<v>` with
+    # "Requirement already satisfied", over a torch directory that imports and
+    # has no `__init__.py`:
+    #
+    #     AttributeError: module 'torch' has no attribute 'cuda'
+    #
+    # Both trees and both metadata directories go, so pip has to install the
+    # wheel it was asked for.
+    local site
+    site="$(torch_site_packages)" || return 1
+    [ -n "$site" ] && [ -d "$site" ] || return 1
+    "$PY" -m pip uninstall -y torch torchvision >/dev/null 2>&1 || true
+    rm -rf "${site}/torch" "${site}/torchvision" \
+        "${site}"/torch-*.dist-info "${site}"/torchvision-*.dist-info
+    note "cleared torch and torchvision from ${site}"
+}
+
 install_cpu_torch() {
     # install_cpu_torch <torch> <torchvision>: restore the artifact default.
+    # The prune matters here too: this runs when a swap failed, and by then the
+    # metadata on disk is exactly the stale kind `pip install` believes.
     local torch_version="$1" torchvision_version="$2"
+    prune_torch || return 1
     "$PY" -m pip install --no-cache-dir --constraint "$CONSTRAINTS" \
         --index-url https://download.pytorch.org/whl/cpu \
         --extra-index-url https://pypi.org/simple \
@@ -514,14 +557,30 @@ install_cuda() {
         return 0
     fi
     [ -f "$CONSTRAINTS" ] || die "missing constraints file: $CONSTRAINTS"
-    local torch_version torchvision_version
-    torch_version="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])')"
-    torchvision_version="$("$PY" -c 'import torchvision; print(torchvision.__version__.split("+")[0])')"
+    local torch_version torchvision_version installed
+    # Prefer the version the artifact ships, which is what the CUDA index is
+    # asked for. A damaged tree cannot report its own version, and that is the
+    # state a failed swap leaves behind, so fall back to the constraint.
+    torch_version="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])' \
+        2>/dev/null || true)"
+    [ -n "$torch_version" ] || torch_version="$(pinned_version torch)"
+    torchvision_version="$("$PY" -c 'import torchvision; print(torchvision.__version__.split("+")[0])' \
+        2>/dev/null || true)"
+    [ -n "$torchvision_version" ] || torchvision_version="$(pinned_version torchvision)"
+    if [ -z "$torch_version" ] || [ -z "$torchvision_version" ]; then
+        warn "cannot determine which torch/torchvision versions to install"
+        return 1
+    fi
     note "matching torch ${torch_version}, torchvision ${torchvision_version}"
-    # Uninstall first. `--force-reinstall` re-resolves torchvision's whole
-    # dependency set (it moved pillow 12.3.0 -> 13.0.0 on a real host); a
-    # constrained fresh install keeps the OCR stack the artifact ships.
-    "$PY" -m pip uninstall -y torch torchvision >/dev/null 2>&1 || true
+    # Uninstall rather than `--force-reinstall`: the latter re-resolves
+    # torchvision's whole dependency set (it moved pillow 12.3.0 -> 13.0.0 on a
+    # real host); a constrained fresh install keeps the OCR stack the artifact
+    # ships. `prune_torch` does the uninstall and removes the metadata a
+    # previous swap left behind, which plain `pip uninstall` trusts.
+    if ! prune_torch; then
+        warn "could not clear the previous torch install; leaving it untouched"
+        return 1
+    fi
     if ! "$PY" -m pip install --no-cache-dir --constraint "$CONSTRAINTS" \
         --index-url https://download.pytorch.org/whl/cu126 \
         --extra-index-url https://pypi.org/simple \
@@ -531,11 +590,22 @@ install_cuda() {
             || warn "the CPU build could not be restored; rerun --reconfigure --with-cuda"
         return 1
     fi
+    # A torch directory without `__init__.py` still imports; only touching an
+    # attribute shows it. Check the import first, so a broken swap is reported
+    # as a broken install (and repaired) rather than as a driver problem.
+    if ! installed="$("$PY" -c 'import torch; print(torch.__version__)' 2>&1)"; then
+        warn "the CUDA build does not import: ${installed}"
+        warn "restoring the CPU build"
+        install_cpu_torch "$torch_version" "$torchvision_version" \
+            || warn "the CPU build could not be restored; rerun --reconfigure --with-cuda"
+        return 1
+    fi
+    note "torch ${installed} installed"
     if "$PY" -c 'import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)'; then
         note "CUDA is available: Docling OCR will use the GPU"
     else
-        warn "torch.cuda.is_available() is false; the cu126 wheels are installed but the"
-        warn "driver is not usable (check nvidia-smi). OCR still runs on the CPU."
+        warn "torch.cuda.is_available() is false; the installed torch build cannot see a GPU"
+        warn "(check nvidia-smi). OCR still runs on the CPU."
         return 1
     fi
     return 0
@@ -918,9 +988,16 @@ PY
 }
 
 _manifest_digest() {
-    # The 64-hex content_digest of a weights manifest, empty when absent.
+    # The 64-hex digest of a weights manifest, empty when absent. The copy
+    # inside the runtime package calls it `content_digest`; the published
+    # `release-manifest.json` calls the same value `weights_content_digest`.
+    # Reading only the first spelling made every `--release` upgrade see an
+    # unknown digest: it warned "the new runtime carries no weights manifest",
+    # downloaded the 780 MiB models package, and then never installed it
+    # because the branch that skips a matching tree never ran.
     [ -f "$1" ] || return 0
-    sed -n 's/.*"content_digest": *"\([0-9a-f]\{64\}\)".*/\1/p' "$1" | head -n1
+    sed -n -e 's/.*"weights_content_digest": *"\([0-9a-f]\{64\}\)".*/\1/p' \
+        -e 's/.*"content_digest": *"\([0-9a-f]\{64\}\)".*/\1/p' "$1" | head -n1
 }
 
 expected_weights_digest() {
@@ -1269,10 +1346,6 @@ do_upgrade() {
         install_deb "$MODELS_DEB"
     fi
 
-    if [ "$WITH_CUDA" = "1" ]; then
-        install_cuda || die "CUDA was requested but is not active; see the warning above"
-    fi
-
     verify_weights_digest || die "installed weights do not match the new runtime; see the remedy above"
 
     # Guarantee 5: configuration, corpus, artifacts and logs were never touched.
@@ -1283,6 +1356,22 @@ do_upgrade() {
     if ! require_doctor; then
         warn "doctor failed after the upgrade; the previous runtime is retained"
         note "roll back with: sudo ${PROGRAM} --rollback"
+        exit 1
+    fi
+
+    # The GPU wheels are a post-install mutation of a runtime that is already
+    # installed, verified and recorded. Doing it before the upgrade was
+    # committed left 1.1.2 unpacked on disk, the state file still describing
+    # 1.1.1, and no torch at all when the swap failed. It runs after `doctor`
+    # and before the timer is restarted (so no sync can import torch mid-swap),
+    # and install_cuda() restores the CPU build before it returns non-zero, so
+    # a failed swap is a reported post-condition instead of a half-finished
+    # upgrade.
+    if [ "$WITH_CUDA" = "1" ] && ! install_cuda; then
+        restart_timer_if_enabled "$timer_was_enabled"
+        warn "the upgrade to ${new_version} is installed and the CPU build is in place,"
+        warn "but CUDA is not active; fix the driver, then rerun:"
+        warn "  sudo ${PROGRAM} --reconfigure --with-cuda"
         exit 1
     fi
 
