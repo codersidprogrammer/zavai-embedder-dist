@@ -983,6 +983,14 @@ retain_package() {
         note "[dry-run] would retain ${deb} for rollback"
         return 0
     fi
+    # A fresh install already retained this package, so an upgrade hands the
+    # retained copy straight back here. `install` refuses to copy a file onto
+    # itself ("are the same file"), which failed the upgrade with "cannot retain
+    # the installed <version> package; refusing to upgrade without a rollback
+    # path" even though the rollback copy was sitting right there.
+    if [ "$deb" -ef "$target" ]; then
+        return 0
+    fi
     install -d -o root -g root -m 0750 "$PACKAGE_CACHE"
     install -m 0640 "$deb" "$target"
 }
